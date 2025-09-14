@@ -1,0 +1,37 @@
+version: "3.9"
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+  servers-panel:
+    build: .
+    restart: unless-stopped
+    environment:
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN}
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET}
+      REDIS_URL: redis://redis:6379/0
+      POLL_MINUTES: 10
+      LOGOUT_DEBOUNCE: 2
+      OFFLINE_THRESHOLD: 2
+      INVENTORY_PATH: /config/inventory.yml
+      SSH_KEY_PATH: /run/secrets/ssh_key
+      PANEL_STATE_PATH: /data/panel.json
+    depends_on:
+      - redis
+    secrets:
+      - ssh_key
+    volumes:
+      - panel_data:/data
+      - ./config:/config
+
+secrets:
+  ssh_key:
+    file: ./secrets/id_rsa
+
+volumes:
+  panel_data:
+  redis_data:

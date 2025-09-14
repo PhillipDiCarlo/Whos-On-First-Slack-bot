@@ -1,0 +1,9 @@
+- host: "10.53.1.87"
+  user: "SlackBot"
+  port: 22
+  label: "Docker Server"
+
+- host: "srv-02.example"
+  user: "watcher"
+  port: 22
+  label: "DB Prod"

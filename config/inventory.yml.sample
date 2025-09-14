@@ -1,0 +1,16 @@
+# Copy this file to config/inventory.yml and edit to match your servers.
+# You can also mount a different path and set INVENTORY_PATH accordingly.
+#
+# Fields:
+# - host  (string, required)
+# - user  (string, required)
+# - port  (int, optional, default 22)
+# - label (string, optional, used for Slack display)
+-
+- host: example-server-1.local
+  user: watcher
+  port: 22
+  label: "Build Server"
+- host: example-server-2.local
+  user: watcher
+  label: "QA Box"
