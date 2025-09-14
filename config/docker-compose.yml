@@ -8,7 +8,7 @@ services:
     build:
       context: ..            # repo root
       dockerfile: Dockerfile # relative to context
-    image: italiandogs/whos-on-first-bot:latest
+    image: slack-bot
     depends_on:
       - redis
     restart: unless-stopped
