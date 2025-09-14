@@ -10,11 +10,11 @@ SLACK_BOT_TOKEN       = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET  = os.environ.get("SLACK_SIGNING_SECRET", "")
 SLACK_APP_TOKEN       = os.environ["SLACK_APP_TOKEN"]  # xapp- for Socket Mode
 REDIS_URL             = os.environ.get("REDIS_URL", "redis://redis:6379/0")
-POLL_MINUTES          = int(os.environ.get("POLL_MINUTES", "10"))
+POLL_INTERVAL_SEC    = int(os.environ.get("POLL_INTERVAL_SEC", "15"))
+HOLD_OCCUPIED_SEC    = int(os.environ.get("HOLD_OCCUPIED_SEC", "600"))
+OFFLINE_AFTER_SEC    = int(os.environ.get("OFFLINE_AFTER_SEC", "600"))
 SSH_KEY_PATH          = os.environ.get("SSH_KEY_PATH", "/run/secrets/ssh_key")
 SSH_TIMEOUT           = int(os.environ.get("SSH_TIMEOUT", "6"))
-OFFLINE_THRESHOLD     = int(os.environ.get("OFFLINE_THRESHOLD", "2"))  # failed polls to call offline
-LOGOUT_DEBOUNCE       = int(os.environ.get("LOGOUT_DEBOUNCE", "2"))    # empty polls to call free
 PANEL_STATE_PATH      = os.environ.get("PANEL_STATE_PATH", "/data/panel.json")
 INVENTORY_PATH        = os.environ.get("INVENTORY_PATH", "/config/inventory.yml")
 # ---- Slack / Redis ----
@@ -99,15 +99,27 @@ def default_state(host, label=None):
         "label": label or host,
         "status": "free",        # "occupied" | "free" | "offline"
         "last_users": [],
-        "empty_streak": 0,       # debounces logout
-        "fail_streak": 0,        # offline detector
+        "empty_streak": 0,       # (legacy, no longer used)
+        "fail_streak": 0,        # (legacy, no longer used)
+        "first_empty_ts": 0,     # epoch when we first saw “no users”
         "last_ok": 0,            # last successful poll epoch
-        "last_update": 0         # last state write epoch
+        "last_update": 0
     }
 
 def load_state(host, label=None):
     raw = r.get(k_host(host))
-    return json.loads(raw) if raw else default_state(host, label)
+    s = json.loads(raw) if raw else default_state(host, label)
+    if label and s.get("label") != label:
+        s["label"] = label
+        try:
+            r.set(k_host(host), json.dumps(s), ex=60*60*24*14)
+        except Exception:
+            pass
+    # backfill in case of older records
+    if "first_empty_ts" not in s: s["first_empty_ts"] = 0
+    if "last_ok" not in s: s["last_ok"] = 0
+    return s
+
 def save_state(s):
     s["last_update"] = int(time.time())
     r.set(k_host(s["host"]), json.dumps(s), ex=60*60*24*14)
@@ -205,34 +217,71 @@ def update_panel():
             pass
 
 def poll_once():
+    now = int(time.time())
+    any_dirty = False
+
     for h in INVENTORY:
         st = load_state(h["host"], h.get("label"))
+        prior_status = st["status"]
+        prior_users = list(st.get("last_users", []))
+
         try:
+            # try SSH
             cmd, out = ssh_who(h)
             users = parse_users(cmd, out) if cmd else []
-            # success path -> reset fail streak
-            st["fail_streak"] = 0
-            st["last_ok"] = int(time.time())
+            st["last_ok"] = now  # success -> refresh last_ok
 
             if users:
-                st["last_users"] = users
-                st["empty_streak"] = 0
-                st["status"] = "occupied"
+                # new login(s)
+                if prior_status != "occupied" or users != prior_users:
+                    st["status"] = "occupied"
+                    st["last_users"] = users
+                    st["first_empty_ts"] = 0
+                    any_dirty = True
+                else:
+                    # still occupied by same users; no change
+                    st["first_empty_ts"] = 0
             else:
-                st["empty_streak"] += 1
-                if st["empty_streak"] >= LOGOUT_DEBOUNCE:
-                    st["status"] = "free"
-                # else keep prior status until we confirm on next poll
+                # no users this poll
+                if st["status"] == "occupied":
+                    # start or continue the hold period
+                    if st["first_empty_ts"] == 0:
+                        st["first_empty_ts"] = now
+                    elif now - st["first_empty_ts"] >= HOLD_OCCUPIED_SEC:
+                        st["status"] = "free"
+                        st["last_users"] = []
+                        st["first_empty_ts"] = 0
+                        any_dirty = True
+                    # else: still within hold window -> remain occupied, no update
+                elif st["status"] == "offline":
+                    # came back online with no users; begin hold timer
+                    if st["first_empty_ts"] == 0:
+                        st["first_empty_ts"] = now
+                    # don’t flip panel yet until hold elapses
+                else:
+                    # already free, nothing to do
+                    pass
+
         except Exception:
-            # failure: keep prior users; bump fail_streak
-            st["fail_streak"] += 1
-            if st["fail_streak"] >= OFFLINE_THRESHOLD:
-                st["status"] = "offline"
-            # Note: do not change empty_streak on SSH failure
+            # SSH failed; decide offline only by last_ok age (time-based)
+            # keep prior status until OFFLINE_AFTER_SEC passes
+            if st["last_ok"] and (now - st["last_ok"] >= OFFLINE_AFTER_SEC):
+                if st["status"] != "offline":
+                    st["status"] = "offline"
+                    st["first_empty_ts"] = 0
+                    st["last_users"] = []
+                    any_dirty = True
+            elif st["last_ok"] == 0 and st["status"] != "offline":
+                # never succeeded yet and unreachable for a while -> mark offline
+                if now - st.get("last_update", now) >= OFFLINE_AFTER_SEC:
+                    st["status"] = "offline"
+                    any_dirty = True
+            # else: within grace window -> no panel change
 
         save_state(st)
 
-    update_panel()
+    if any_dirty:
+        update_panel()
 
 # Slash command: create (or move) the panel in the current channel
 @app.command("/servers_panel")
@@ -243,7 +292,7 @@ def servers_panel(ack, body, respond):
     blocks = render_panel_blocks([load_state(h["host"], h.get("label")) for h in INVENTORY])
     res = app.client.chat_postMessage(channel=channel, text="Server Login Status", blocks=blocks)
     set_panel_state({"channel": channel, "ts": res["ts"]})
-    respond("Panel created. I’ll keep this message updated every few minutes.")
+    respond("Panel created. I'll keep this message updated every few minutes.")
 
 # Optional manual refresh
 @app.command("/servers_refresh")
@@ -254,7 +303,11 @@ def servers_refresh(ack, respond):
 
 # Scheduler
 scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(poll_once, "interval", minutes=POLL_MINUTES)
+scheduler.add_job(
+    poll_once, "interval",
+    seconds=POLL_INTERVAL_SEC,
+    max_instances=1, coalesce=True
+)
 
 if __name__ == "__main__":
     scheduler.start()
