@@ -1,0 +1,32 @@
+# config/docker-compose.yml  (no version key needed)
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  slack-bot:
+    build:
+      context: ..            # repo root
+      dockerfile: Dockerfile # relative to context
+    image: italiandogs/whos-on-first-bot:latest
+    depends_on:
+      - redis
+    restart: unless-stopped
+    env_file: ../.env
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      INVENTORY_PATH: /config/inventory.yml
+      SSH_KEY_PATH: /run/secrets/ssh_key
+      PANEL_STATE_PATH: /data/panel.json
+    volumes:
+      - ../inventory.yml:/config/inventory.yml:ro
+      - bot_data:/data
+    secrets:
+      - ssh_key
+
+volumes:
+  bot_data: {}
+
+secrets:
+  ssh_key:
+    file: ../secrets/id_rsa
